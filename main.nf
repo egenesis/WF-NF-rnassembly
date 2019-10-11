@@ -19,7 +19,7 @@ def helpMessage() {
 
     The typical command for running the pipeline is as follows:
 
-    nextflow run nf-core/rnassembly --reads '*_R{1,2}.fastq.gz' -profile docker
+    nextflow run nf-core/rnassembly --bams '*bam' -profile docker
 
     Mandatory arguments:
       --reads                       Path to input data (must be surrounded with quotes)
@@ -31,7 +31,18 @@ def helpMessage() {
       --singleEnd                   Specifies that the input is single end reads
 
     References                      If not specified in the configuration file or you wish to overwrite any of the references.
-      --fasta                       Path to Fasta reference
+      --genome                      Name of iGenomes reference
+      --salmon_index                Path to Salmon index
+      --fasta                       Path to genome fasta file
+      --gtf                         Path to GTF file
+      --saveReference               Save the generated reference files to the results directory
+      --gencode                     Use fc_group_features_type = 'gene_type' and pass '--gencode' flag to Salmon
+      --compressedReference         If provided, all reference files are assumed to be gzipped and will be unzipped before using
+    
+    Strandedness:
+      --forwardStranded             The library is forward stranded
+      --reverseStranded             The library is reverse stranded
+      --unStranded                  The default behaviour
 
     Other options:
       --outdir                      The output directory where the results will be saved
@@ -101,26 +112,26 @@ ch_output_docs = Channel.fromPath("$baseDir/docs/output.md")
  * Create a channel for input read files
  */
 if(params.readPaths){
-    if(params.singleEnd){
         Channel
             .from(params.readPaths)
             .map { row -> [ row[0], [file(row[1][0])]] }
             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    } else {
-        Channel
-            .from(params.readPaths)
-            .map { row -> [ row[0], [file(row[1][0]), file(row[1][1])]] }
-            .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { read_files_fastqc; read_files_trimming }
-    }
+            .into { bam_stringtieFPKM; bam_featurec; bam_salmon }
 } else {
     Channel
-        .fromFilePairs( params.reads, size: params.singleEnd ? 1 : 2 )
+        .fromFilePairs( params.reads, size: 1 )
         .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-        .into { read_files_fastqc; read_files_trimming }
+        .into { bam_stringtieFPKM; bam_featurec; bam_salmon }
 }
 
+Channel
+    .fromPath(params.gtf, checkIfExists: true)
+    .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
+    .into { gtf_stringtieFPKM }
+
+forwardStranded = params.forwardStranded
+reverseStranded = params.reverseStranded
+unStranded = params.unStranded
 
 // Header log info
 log.info nfcoreHeader()
@@ -199,28 +210,195 @@ process get_software_versions {
     """
 }
 
+   /*
+   * STEP 12 - stringtie FPKM
+   */
+  process stringtieFPKM {
+      label 'mid_memory'
+      tag "${name - '.sorted'}"
+      publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
+          saveAs: {filename ->
+              if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
+              else if (filename.indexOf("cov_refs.gtf") > 0) "cov_refs/$filename"
+              else if (filename.indexOf("ballgown") > 0) "ballgown/$filename"
+              else "$filename"
+          }
 
+      input:
+      set val(name), file(bam) from bam_stringtieFPKM
+      file gtf from gtf_stringtieFPKM.collect()
+
+      output:
+      file "${name}_transcripts.gtf"
+      file "${name}_merged_transcripts.gtf" into stringtieGTF4fc, stringtieGTF4salmon 
+      file "${name}.gene_abund.txt"
+      file "${name}.cov_refs.gtf"
+
+      script:
+      def st_direction = ''
+      if (forwardStranded && !unStranded){
+          st_direction = "--fr"
+      } else if (reverseStranded && !unStranded){
+          st_direction = "--rf"
+      }
+      """
+      stringtie $bam \\
+          $st_direction \\
+          -o ${name}_transcripts.gtf \\
+          -v \\
+          -G $gtf \\
+          -A ${name}.gene_abund.txt \\
+          -C ${name}.cov_refs.gtf
+      stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
+      """
+  }
+
+  process featureCounts {
+      label 'low_memory'
+      tag "${name - '.sorted'}"
+      publishDir "${params.outdir}/featureCounts", mode: 'copy',
+          saveAs: {filename ->
+              if (filename.indexOf("biotype_counts") > 0) "biotype_counts/$filename"
+              else if (filename.indexOf("_gene.featureCounts.txt.summary") > 0) "gene_count_summaries/$filename"
+              else if (filename.indexOf("_gene.featureCounts.txt") > 0) "gene_counts/$filename"
+              else "$filename"
+          }
+
+      input:
+      set val(name), file(bam) from bam_featurec
+      file gtf from stringtieGTF4fc.collect()
+
+      output:
+      file "${name}_gene.featureCounts.txt" into geneCounts, featureCounts_to_merge
+      file "${name}_gene.featureCounts.txt.summary" into featureCounts_logs
+
+      script:
+      def featureCounts_direction = 0
+      if (forwardStranded && !unStranded) {
+          featureCounts_direction = 1
+      } else if (reverseStranded && !unStranded){
+          featureCounts_direction = 2
+      }
+      // Try to get real sample name
+      sample_name = name - 'Aligned.sortedByCoord.out' - '_subsamp.sorted'
+      """
+      featureCounts -a $gtf -g gene_id -t exon -o ${name}_gene.featureCounts.txt -p -s $featureCounts_direction $bam
+      """
+  }
 
 /*
- * STEP 1 - FastQC
+ * STEP 11 - Transcriptome quantification with Salmon
  */
-process fastqc {
-    tag "$name"
-    publishDir "${params.outdir}/fastqc", mode: 'copy',
-        saveAs: {filename -> filename.indexOf(".zip") > 0 ? "zips/$filename" : "$filename"}
+if (params.pseudo_aligner == 'salmon'){
+    process makeSalmonIndex {
+        label "salmon"
+        tag "$fasta"
+        publishDir path: { params.saveReference ? "${params.outdir}/reference_genome" : params.outdir },
+                           saveAs: { params.saveReference ? it : null }, mode: 'copy'
 
-    input:
-    set val(name), file(reads) from read_files_fastqc
+        input:
+        file gtf from stringtieGTF4salmon
+        file fasta from fasta4salmon
 
-    output:
-    file "*_fastqc.{zip,html}" into fastqc_results
+        output:
+        file 'salmon_index' into salmon_index
 
-    script:
-    """
-    fastqc -q $reads
-    """
+        script:
+        def gencode = params.gencode  ? "--gencode" : ""
+        """
+        gffread -F -w transcripts.fa -g $fasta ${gtf.baseName}
+        salmon index --threads $task.cpus -t transcripts.fa -i salmon_index
+        """
+    }
+    
+    process salmon {
+        label 'salmon'
+        tag "$sample"
+        publishDir "${params.outdir}/salmon", mode: 'copy'
+
+        input:
+        set sample, file(reads) from trimmed_reads_salmon
+        file index from salmon_index.collect()
+        file gtf from gtf_salmon.collect()
+
+        output:
+        file "${sample}/" into salmon_logs
+        set val(sample), file("${sample}/") into salmon_tximport
+
+        script:
+        def rnastrandness = params.singleEnd ? 'U' : 'IU'
+        if (forwardStranded && !unStranded){
+            rnastrandness = params.singleEnd ? 'SF' : 'ISF'
+        } else if (reverseStranded && !unStranded){
+            rnastrandness = params.singleEnd ? 'SR' : 'ISR'
+        }
+        def endedness = params.singleEnd ? "-r ${reads[0]}" : "-1 ${reads[0]} -2 ${reads[1]}"
+        unmapped = params.saveUnaligned ? "--writeUnmappedNames" : ''
+        """
+        salmon quant --validateMappings \\
+                        --seqBias --useVBOpt --gcBias \\
+                        --geneMap ${gtf} \\
+                        --threads ${task.cpus} \\
+                        --libType=${rnastrandness} \\
+                        --index ${index} \\
+                        $endedness $unmapped\\
+                        -o ${sample}
+        """
+        }
+
+    process salmon_tximport {
+      label 'low_memory'
+
+      input:
+      set val(name), file ("salmon/*") from salmon_tximport
+      file gtf from gtf_salmon_merge.collect()
+
+      output:
+      file "${name}_salmon_gene_tpm.csv" into salmon_gene_tpm
+      file "${name}_salmon_gene_counts.csv" into salmon_gene_counts
+      file "${name}_salmon_transcript_tpm.csv" into salmon_transcript_tpm
+      file "${name}_salmon_transcript_counts.csv" into salmon_transcript_counts
+
+      script:
+      """
+      parse_gtf.py --gtf $gtf --salmon salmon --id ${params.fc_group_features} --extra ${params.fc_extra_attributes} -o tx2gene.csv
+      tximport.r NULL salmon ${name}
+      """
+    }
+
+    process salmon_merge {
+      label 'mid_memory'
+      publishDir "${params.outdir}/salmon", mode: 'copy'
+
+      input:
+      file gene_tpm_files from salmon_gene_tpm.collect()
+      file gene_count_files from salmon_gene_counts.collect()
+      file transcript_tpm_files from salmon_transcript_tpm.collect()
+      file transcript_count_files from salmon_transcript_counts.collect()
+
+      output:
+      file "salmon_merged*.csv" into salmon_merged_ch
+
+      script:
+      // First field is the gene/transcript ID
+      gene_ids = "<(cut -f1 -d, ${gene_tpm_files[0]} | tail -n +2 | cat <(echo '${params.fc_group_features}') - )"
+      transcript_ids = "<(cut -f1 -d, ${transcript_tpm_files[0]} | tail -n +2 | cat <(echo 'transcript_id') - )"
+
+      // Second field is counts/TPM
+      gene_tpm = gene_tpm_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
+      gene_counts = gene_count_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
+      transcript_tpm = transcript_tpm_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
+      transcript_counts = transcript_count_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
+      """
+      paste -d, $gene_ids $gene_tpm > salmon_merged_gene_tpm.csv
+      paste -d, $gene_ids $gene_counts > salmon_merged_gene_counts.csv
+      paste -d, $transcript_ids $transcript_tpm > salmon_merged_transcript_tpm.csv
+      paste -d, $transcript_ids $transcript_counts > salmon_merged_transcript_counts.csv
+      """
+    }
+} else {
+    salmon_logs = Channel.empty()
 }
-
 
 
 /*
@@ -232,7 +410,6 @@ process multiqc {
     input:
     file multiqc_config from ch_multiqc_config
     // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('fastqc/*') from fastqc_results.collect().ifEmpty([])
     file ('software_versions/*') from software_versions_yaml.collect()
     file workflow_summary from create_workflow_summary(summary)
 

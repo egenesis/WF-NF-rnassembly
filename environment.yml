@@ -5,7 +5,20 @@ channels:
   - conda-forge
   - bioconda
   - defaults
-dependencies:
-  # TODO nf-core: Add required software dependencies here
+ddependencies:
+  ## conda-forge packages
+  - conda-forge::r-data.table=1.12.2
+  - conda-forge::r-gplots=3.0.1.1
+  - conda-forge::r-markdown=0.9
+  - matplotlib=3.0.3        # Current 3.1.0 build incompatible with multiqc=1.7
+
+  ## bioconda packages
   - fastqc=0.11.8
+  - atropos=0.6.2
+  - stringtie=1.3.6
+  - samtools=1.9
+  - gffread=0.11.4
+  - pasa=2.3.3
+  - spades=3.13.1
+  - blast=2.9.0
   - multiqc=1.7
