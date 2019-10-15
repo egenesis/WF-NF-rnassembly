@@ -114,15 +114,16 @@ ch_output_docs = Channel.fromPath("$baseDir/docs/output.md")
 if(params.readPaths){
         Channel
             .from(params.readPaths)
-            .map { row -> [ row[0], [file(row[1][0])]] }
+            .map { row -> [ row[0], [file(row[1][0]), file(row[1][1])]] }
             .ifEmpty { exit 1, "params.readPaths was empty - no input files supplied" }
-            .into { bam_stringtieFPKM; bam_featurec; bam_salmon }
+            .into { ch_trimming }
 } else {
     Channel
-        .fromFilePairs( params.reads, size: 1 )
+        .fromFilePairs( params.reads, size: 2 )
         .ifEmpty { exit 1, "Cannot find any reads matching: ${params.reads}\nNB: Path needs to be enclosed in quotes!\nIf this is single-end data, please specify --singleEnd on the command line." }
-        .into { bam_stringtieFPKM; bam_featurec; bam_salmon }
+        .into { ch_trimming }
 }
+
 
 Channel
     .fromPath(params.gtf, checkIfExists: true)
@@ -186,231 +187,186 @@ ${summary.collect { k,v -> "            <dt>$k</dt><dd><samp>${v ?: '<span style
 
 
 /*
- * Parse software version numbers
+ * STEP N - Atropos
  */
-process get_software_versions {
-    publishDir "${params.outdir}/pipeline_info", mode: 'copy',
-    saveAs: {filename ->
-        if (filename.indexOf(".csv") > 0) filename
-        else null
-    }
+process trimming {
+    publishDir "${params.outdir}/trimmed", mode: 'copy'
+
+    input: 
+    set val(name), file(reads) from ch_trimming
 
     output:
-    file 'software_versions_mqc.yaml' into software_versions_yaml
-    file "software_versions.csv"
+    set val(name), file("*fq.gz") into ch_fastq1, ch_fastq2
 
     script:
-    // TODO nf-core: Get all tools to print their version number here
+    if ( task.cpus > 1 ){
+        threads = "--threads ${tast.cpus}"
+    } else 
+    {
+        threads = ""
+    }
     """
-    echo $workflow.manifest.version > v_pipeline.txt
-    echo $workflow.nextflow.version > v_nextflow.txt
-    fastqc --version > v_fastqc.txt
-    multiqc --version > v_multiqc.txt
-    scrape_software_versions.py &> software_versions_mqc.yaml
+    atropos $threads -a AGATCGGAAGAGC  -a AAAAAAAAA \\
+            -A AGATCGGAAGAGC -A TTTTTTTTTTTT \\
+            --minimum-length 50 \\
+            -q 20 \\
+            --trim-n \\
+            -o $name.1.fq.gz -p $name.2.fq.gz \\
+            -pe1 ${reads[0]} -pe2 ${reads[1]}
+
     """
 }
 
-   /*
-   * STEP 12 - stringtie FPKM
-   */
-  process stringtieFPKM {
-      label 'mid_memory'
-      tag "${name - '.sorted'}"
-      publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
-          saveAs: {filename ->
-              if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
-              else if (filename.indexOf("cov_refs.gtf") > 0) "cov_refs/$filename"
-              else if (filename.indexOf("ballgown") > 0) "ballgown/$filename"
-              else "$filename"
-          }
+ch_fastq1
+    .map {sample -> sample[1][0]}
+    .collect()
+    .set { ch_fastq_r1}
 
-      input:
-      set val(name), file(bam) from bam_stringtieFPKM
-      file gtf from gtf_stringtieFPKM.collect()
+ch_fastq2
+    .map {sample -> sample[1][1]}
+    .collect()
+    .set { ch_fastq_r2}
 
-      output:
-      file "${name}_transcripts.gtf"
-      file "${name}_merged_transcripts.gtf" into stringtieGTF4fc, stringtieGTF4salmon 
-      file "${name}.gene_abund.txt"
-      file "${name}.cov_refs.gtf"
+process merge {
+    input: 
+    file(reads1) from ch_fastq_r1.collect()
+    file(reads2) from ch_fastq_r2.collect()
 
-      script:
-      def st_direction = ''
-      if (forwardStranded && !unStranded){
-          st_direction = "--fr"
-      } else if (reverseStranded && !unStranded){
-          st_direction = "--rf"
-      }
-      """
-      stringtie $bam \\
-          $st_direction \\
-          -o ${name}_transcripts.gtf \\
-          -v \\
-          -G $gtf \\
-          -A ${name}.gene_abund.txt \\
-          -C ${name}.cov_refs.gtf
-      stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
-      """
-  }
+    output:
+    file("*fq.gz") into ch_fq_merged
 
-  process featureCounts {
-      label 'low_memory'
-      tag "${name - '.sorted'}"
-      publishDir "${params.outdir}/featureCounts", mode: 'copy',
-          saveAs: {filename ->
-              if (filename.indexOf("biotype_counts") > 0) "biotype_counts/$filename"
-              else if (filename.indexOf("_gene.featureCounts.txt.summary") > 0) "gene_count_summaries/$filename"
-              else if (filename.indexOf("_gene.featureCounts.txt") > 0) "gene_counts/$filename"
-              else "$filename"
-          }
-
-      input:
-      set val(name), file(bam) from bam_featurec
-      file gtf from stringtieGTF4fc.collect()
-
-      output:
-      file "${name}_gene.featureCounts.txt" into geneCounts, featureCounts_to_merge
-      file "${name}_gene.featureCounts.txt.summary" into featureCounts_logs
-
-      script:
-      def featureCounts_direction = 0
-      if (forwardStranded && !unStranded) {
-          featureCounts_direction = 1
-      } else if (reverseStranded && !unStranded){
-          featureCounts_direction = 2
-      }
-      // Try to get real sample name
-      sample_name = name - 'Aligned.sortedByCoord.out' - '_subsamp.sorted'
-      """
-      featureCounts -a $gtf -g gene_id -t exon -o ${name}_gene.featureCounts.txt -p -s $featureCounts_direction $bam
-      """
-  }
+    script:
+    """
+    zcat $reads1 | gzip > reads.1.fq.gz
+    zcat $reads2 | gzip > reads.2.fq.gz
+    """
+}
 
 /*
- * STEP 11 - Transcriptome quantification with Salmon
+ * STEP N - SPAdes
  */
-if (params.pseudo_aligner == 'salmon'){
-    process makeSalmonIndex {
-        label "salmon"
-        tag "$fasta"
-        publishDir path: { params.saveReference ? "${params.outdir}/reference_genome" : params.outdir },
-                           saveAs: { params.saveReference ? it : null }, mode: 'copy'
+process spades {
+    publishDir "${params.outdir}", mode: 'copy'
 
-        input:
-        file gtf from stringtieGTF4salmon
-        file fasta from fasta4salmon
+    input:
+    file(reads) from ch_fq_merged
 
-        output:
-        file 'salmon_index' into salmon_index
+    output:
+    file("spades/*") into spades_output
+    file("spades/transcripts.fasta") into spades_tx
 
-        script:
-        def gencode = params.gencode  ? "--gencode" : ""
-        """
-        gffread -F -w transcripts.fa -g $fasta ${gtf.baseName}
-        salmon index --threads $task.cpus -t transcripts.fa -i salmon_index
-        """
-    }
-    
-    process salmon {
-        label 'salmon'
-        tag "$sample"
-        publishDir "${params.outdir}/salmon", mode: 'copy'
+    script:
+    """
+    spades.py --pe1-1 ${reads[0]} \\
+              --pe1-2 ${reads[1]} \\
+              --rna \\
+              -o spades
+    """
+}
 
-        input:
-        set sample, file(reads) from trimmed_reads_salmon
-        file index from salmon_index.collect()
-        file gtf from gtf_salmon.collect()
-
-        output:
-        file "${sample}/" into salmon_logs
-        set val(sample), file("${sample}/") into salmon_tximport
-
-        script:
-        def rnastrandness = params.singleEnd ? 'U' : 'IU'
-        if (forwardStranded && !unStranded){
-            rnastrandness = params.singleEnd ? 'SF' : 'ISF'
-        } else if (reverseStranded && !unStranded){
-            rnastrandness = params.singleEnd ? 'SR' : 'ISR'
-        }
-        def endedness = params.singleEnd ? "-r ${reads[0]}" : "-1 ${reads[0]} -2 ${reads[1]}"
-        unmapped = params.saveUnaligned ? "--writeUnmappedNames" : ''
-        """
-        salmon quant --validateMappings \\
-                        --seqBias --useVBOpt --gcBias \\
-                        --geneMap ${gtf} \\
-                        --threads ${task.cpus} \\
-                        --libType=${rnastrandness} \\
-                        --index ${index} \\
-                        $endedness $unmapped\\
-                        -o ${sample}
-        """
-        }
-
-    process salmon_tximport {
-      label 'low_memory'
-
-      input:
-      set val(name), file ("salmon/*") from salmon_tximport
-      file gtf from gtf_salmon_merge.collect()
-
-      output:
-      file "${name}_salmon_gene_tpm.csv" into salmon_gene_tpm
-      file "${name}_salmon_gene_counts.csv" into salmon_gene_counts
-      file "${name}_salmon_transcript_tpm.csv" into salmon_transcript_tpm
-      file "${name}_salmon_transcript_counts.csv" into salmon_transcript_counts
-
-      script:
-      """
-      parse_gtf.py --gtf $gtf --salmon salmon --id ${params.fc_group_features} --extra ${params.fc_extra_attributes} -o tx2gene.csv
-      tximport.r NULL salmon ${name}
-      """
-    }
-
-    process salmon_merge {
-      label 'mid_memory'
-      publishDir "${params.outdir}/salmon", mode: 'copy'
-
-      input:
-      file gene_tpm_files from salmon_gene_tpm.collect()
-      file gene_count_files from salmon_gene_counts.collect()
-      file transcript_tpm_files from salmon_transcript_tpm.collect()
-      file transcript_count_files from salmon_transcript_counts.collect()
-
-      output:
-      file "salmon_merged*.csv" into salmon_merged_ch
-
-      script:
-      // First field is the gene/transcript ID
-      gene_ids = "<(cut -f1 -d, ${gene_tpm_files[0]} | tail -n +2 | cat <(echo '${params.fc_group_features}') - )"
-      transcript_ids = "<(cut -f1 -d, ${transcript_tpm_files[0]} | tail -n +2 | cat <(echo 'transcript_id') - )"
-
-      // Second field is counts/TPM
-      gene_tpm = gene_tpm_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
-      gene_counts = gene_count_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
-      transcript_tpm = transcript_tpm_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
-      transcript_counts = transcript_count_files.collect{f -> "<(cut -d, -f2 ${f})"}.join(" ")
-      """
-      paste -d, $gene_ids $gene_tpm > salmon_merged_gene_tpm.csv
-      paste -d, $gene_ids $gene_counts > salmon_merged_gene_counts.csv
-      paste -d, $transcript_ids $transcript_tpm > salmon_merged_transcript_tpm.csv
-      paste -d, $transcript_ids $transcript_counts > salmon_merged_transcript_counts.csv
-      """
-    }
-} else {
-    salmon_logs = Channel.empty()
+/*
+ * STEP N - TransDecoder.longORF
+ */
+process transdec_longorf {
+    publishDir "${params.outdir}/transdecoder", mode: 'copy'
+    when:
+    false
+    script:
+    """
+    TransDecoder.LongOrfs -t target_transcripts.fasta
+    """
 }
 
 
 /*
- * STEP 2 - MultiQC
+ * STEP N - Blastp-known
+ */
+process blastp_own {
+    publishDir "${params.outdir}/blastp_known", mode: 'copy'
+    when:
+    false
+    script:
+    """
+    blastp -query transdecoder_dir/longest_orfs.pep  \
+    -db uniprot_sprot.fasta  -max_target_seqs 1 \
+    -outfmt 6 -evalue 1e-5 -num_threads 10 > blastp.outfmt6
+    """
+}
+
+
+/*
+ * STEP N - Blastp
+ */
+process blastp {
+    publishDir "${params.outdir}/blastp", mode: 'copy'
+    when:
+    false
+
+    script:
+    """
+    blastp -query transdecoder_dir/longest_orfs.pep  \
+    -db uniprot_sprot.fasta  -max_target_seqs 1 \
+    -outfmt 6 -evalue 1e-5 -num_threads 10 > blastp.outfmt6
+    """
+}
+
+/*
+ * STEP N - hmmscan
+ */
+process  hmmscane{
+    publishDir "${params.outdir}/hmmer", mode: 'copy'
+    when:
+    false
+
+    script:
+    """
+    hmmscan --cpu 8 --domtblout pfam.domtblout /path/to/Pfam-A.hmm transdecoder_dir/longest_orfs.pep
+    """
+}
+
+/*
+* STEP N -  transdecode Predict
+*/
+process transdec_predict {
+    publishDir "${params.outdir}/transdecoder", mode: 'copy'
+    when:
+        false
+
+    script:
+    """
+    TransDecoder.Predict -t target_transcripts.fasta --retain_pfam_hits pfam.domtblout --retain_blastp_hits blastp.outfmt6
+    """
+}
+
+/*
+ * STEP N - PASA
+ */
+process pasa {
+    publishDir "${params.outdir}/PASA", mode: 'copy'
+    when:
+    false
+    script:
+    """
+    cp $PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config 
+    Launch_PASA_pipeline.pl \
+           -c alignAssembly.config -C -R -g genome_sample.fasta \
+           -t all_transcripts.fasta.clean -T -u all_transcripts.fasta \
+           --ALIGNERS blat,gmap --CPU 2
+    """
+}
+
+/*
+ * STEP N - MultiQC
  */
 process multiqc {
     publishDir "${params.outdir}/MultiQC", mode: 'copy'
+    when:
+    false
 
     input:
     file multiqc_config from ch_multiqc_config
     // TODO nf-core: Add in log files from your new processes for MultiQC to find!
-    file ('software_versions/*') from software_versions_yaml.collect()
+    //file ('software_versions/*') from software_versions_yaml.collect()
     file workflow_summary from create_workflow_summary(summary)
 
     output:
