@@ -32,11 +32,10 @@ def helpMessage() {
 
     References                      If not specified in the configuration file or you wish to overwrite any of the references.
       --genome                      Name of iGenomes reference
-      --salmon_index                Path to Salmon index
       --fasta                       Path to genome fasta file
       --gtf                         Path to GTF file
+      --proteins                    ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
       --saveReference               Save the generated reference files to the results directory
-      --gencode                     Use fc_group_features_type = 'gene_type' and pass '--gencode' flag to Salmon
       --compressedReference         If provided, all reference files are assumed to be gzipped and will be unzipped before using
     
     Strandedness:
@@ -129,6 +128,12 @@ Channel
     .fromPath(params.gtf, checkIfExists: true)
     .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
     .into { gtf_stringtieFPKM }
+
+
+Channel
+    .fromPath(params.tx, checkIfExists: true)
+    .ifEmpty { exit 1, "Tx fasta file not found: ${params.tx}" }
+    .into { tx_fasta }
 
 forwardStranded = params.forwardStranded
 reverseStranded = params.reverseStranded
@@ -269,11 +274,16 @@ process spades {
  */
 process transdec_longorf {
     publishDir "${params.outdir}/transdecoder", mode: 'copy'
-    when:
-    false
+    input:
+    file(tx) from spades_tx
+    output:
+    file("transcripts.fasta.transdecoder_dir/*")
+    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx
+    file("transcripts.fasta.transdecoder_dir/longest_orfs.cds") into longestcds_tx
+
     script:
     """
-    TransDecoder.LongOrfs -t target_transcripts.fasta
+    TransDecoder.LongOrfs -t $tx
     """
 }
 
@@ -281,18 +291,24 @@ process transdec_longorf {
 /*
  * STEP N - Blastp-known
  */
-process blastp_own {
-    publishDir "${params.outdir}/blastp_known", mode: 'copy'
-    when:
-    false
+process blastnt_own {
+    publishDir "${params.outdir}/blastn_known", mode: 'copy'
+    
+    input:
+    file(cds) from longestcds_tx
+    file(tx) from tx_fasta
+
+    output:
+    file("blastn.known.outfmt6") into blastn_known
+
     script:
     """
-    blastp -query transdecoder_dir/longest_orfs.pep  \
-    -db uniprot_sprot.fasta  -max_target_seqs 1 \
-    -outfmt 6 -evalue 1e-5 -num_threads 10 > blastp.outfmt6
+    makeblastdb -in $tx -input_type blastdb -dbtype nucl -parse_seqids -out known_tx
+    blastn -query $cds  \\
+    -db known_tx  -max_target_seqs 1 \\
+    -outfmt 6 -evalue 1e-5 -num_threads ${task.cpus} > blastn.known.outfmt6
     """
 }
-
 
 /*
  * STEP N - Blastp
