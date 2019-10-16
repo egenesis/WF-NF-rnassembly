@@ -134,7 +134,6 @@ Channel
     .ifEmpty { exit 1, "Tx fasta file not found: ${params.tx}" }
     .into { tx_fasta }
 
-
 Channel
     .fromPath(params.proteins, checkIfExists: true)
     .ifEmpty { exit 1, "Proteins fasta file not found: ${params.proteins}" }
@@ -381,7 +380,7 @@ process blastp {
 * STEP N -  transdecode Predict
 */
 process transdec_predict {
-    publishDir "${params.outdir}/transdecoder/predict", mode: 'copy'
+    publishDir "${params.outdir}/transdecoder", mode: 'copy'
     
     input:
     file(tx) from tx_unknown2
@@ -389,12 +388,13 @@ process transdec_predict {
     file(fmt) from blastp
     
     output:
-    file("predict/*")
+    file("*.transdecoder.*")
+    file("*.transdecoder.cds") into transdecoder_cds
 
     script:
     """
     # --retain_pfam_hits pfam
-    TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict
+    TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict --no_refine_starts
     """
 }
 
@@ -403,15 +403,26 @@ process transdec_predict {
  */
 process pasa {
     publishDir "${params.outdir}/PASA", mode: 'copy'
-    when:
-    false
+
+    input:
+    file(gtf) from gtf_stringtieFPKM
+    file(tx) from transdecoder_cds
+    file(genome) from fasta
+
+    output:
+    file("sample_mydb_pasa*")
+
     script:
     """
     # cpus 8
-    cp $PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config 
-    Launch_PASA_pipeline.pl \
-           -c alignAssembly.config -C -R -g genome_sample.fasta \
-           -t all_transcripts.fasta.clean -T -u all_transcripts.fasta \
+    export PASAHOME=\$(dirname \$(which python))/../opt/pasa-2.3.3
+    cp \$PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config
+    awk '{if (\$0~/^>/) {print \$1} else {print \$0}}' $tx > tx.fa
+    \$PASAHOME/bin/seqclean tx.fa
+    Launch_PASA_pipeline.pl \\
+           -L --annots $gtf \\
+           -c alignAssembly.config -C -R -g $genome \\
+           -t tx.fa.clean -T -u tx.fa \\
            --ALIGNERS blat --CPU ${task.cpus}
     """
 }
