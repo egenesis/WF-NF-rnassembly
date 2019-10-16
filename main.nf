@@ -403,7 +403,8 @@ process transdec_predict {
  */
 process pasa {
     publishDir "${params.outdir}/PASA", mode: 'copy'
-
+    when:
+    false
     input:
     file(gtf) from gtf_stringtieFPKM
     file(tx) from transdecoder_cds
@@ -419,7 +420,7 @@ process pasa {
     cp \$PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config
     awk '{if (\$0~/^>/) {print \$1} else {print \$0}}' $tx > tx.fa
     \$PASAHOME/bin/seqclean tx.fa
-    Launch_PASA_pipeline.pl \\
+    \$PASAHOME/Launch_PASA_pipeline.pl \\
            -L --annots $gtf \\
            -c alignAssembly.config -C -R -g $genome \\
            -t tx.fa.clean -T -u tx.fa \\
