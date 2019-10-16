@@ -129,11 +129,17 @@ Channel
     .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
     .into { gtf_stringtieFPKM }
 
-
 Channel
     .fromPath(params.tx, checkIfExists: true)
     .ifEmpty { exit 1, "Tx fasta file not found: ${params.tx}" }
     .into { tx_fasta }
+
+
+Channel
+    .fromPath(params.proteins, checkIfExists: true)
+    .ifEmpty { exit 1, "Proteins fasta file not found: ${params.proteins}" }
+    .into { prot_fasta }
+
 
 forwardStranded = params.forwardStranded
 reverseStranded = params.reverseStranded
@@ -258,7 +264,7 @@ process spades {
 
     output:
     file("spades/*") into spades_output
-    file("spades/transcripts.fasta") into spades_tx
+    file("spades/transcripts.fasta") into spades2blastn_tx
 
     script:
     """
@@ -270,32 +276,13 @@ process spades {
 }
 
 /*
- * STEP N - TransDecoder.longORF
- */
-process transdec_longorf {
-    publishDir "${params.outdir}/transdecoder", mode: 'copy'
-    input:
-    file(tx) from spades_tx
-    output:
-    file("transcripts.fasta.transdecoder_dir/*")
-    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx
-    file("transcripts.fasta.transdecoder_dir/longest_orfs.cds") into longestcds_tx
-
-    script:
-    """
-    TransDecoder.LongOrfs -t $tx
-    """
-}
-
-
-/*
  * STEP N - Blastp-known
  */
-process blastnt_own {
+process blastnt_known {
     publishDir "${params.outdir}/blastn_known", mode: 'copy'
     
     input:
-    file(cds) from longestcds_tx
+    file(cds) from spades2blastn_tx
     file(tx) from tx_fasta
 
     output:
@@ -303,10 +290,52 @@ process blastnt_own {
 
     script:
     """
-    makeblastdb -in $tx -input_type blastdb -dbtype nucl -parse_seqids -out known_tx
+    makeblastdb -in $tx -input_type fasta -dbtype nucl -parse_seqids -out known_tx
     blastn -query $cds  \\
     -db known_tx  -max_target_seqs 1 \\
     -outfmt 6 -evalue 1e-5 -num_threads ${task.cpus} > blastn.known.outfmt6
+    """
+}
+
+/*
+ * STEP N - Blastp-known
+ */
+process blastnt_parse {
+    publishDir "${params.outdir}/blastn_known", mode: 'copy'
+    
+    input:
+    file(cds) from spades2blastn_tx
+    file(outfmt) from blastn_known
+
+    output:
+    file("transcript_unkown.fa") into tx_unknown1
+    file("transcript_unkown.fa") into tx_unknown2
+
+    script:
+    """
+    clean_blastnt.py $outfmt > transcript_unkown
+    cat $cds | seqkit grep -v -f transcript_unkown > transcript_unkown.fa
+    """
+}
+
+
+/*
+ * STEP N - TransDecoder.longORF
+ */
+process transdec_longorf {
+    publishDir "${params.outdir}/transdecoder", mode: 'copy'
+
+    input:
+    file(tx) from tx_unknown1
+
+    output:
+    file("transcripts.fasta.transdecoder_dir/*") into longorf_dir
+    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx
+
+    script:
+    """
+    ln -s $tx transcripts.fasta
+    TransDecoder.LongOrfs -t transcripts.fasta
     """
 }
 
@@ -315,42 +344,57 @@ process blastnt_own {
  */
 process blastp {
     publishDir "${params.outdir}/blastp", mode: 'copy'
-    when:
-    false
 
+    input:
+    file(prot) from prot_fasta
+    file(tx) from longestorf_tx
+
+    output:
+    file("blastp.outfmt6") into blastp
     script:
     """
-    blastp -query transdecoder_dir/longest_orfs.pep  \
-    -db uniprot_sprot.fasta  -max_target_seqs 1 \
-    -outfmt 6 -evalue 1e-5 -num_threads 10 > blastp.outfmt6
+    makeblastdb -in $prot -input_type fasta -dbtype prot -parse_seqids -out known_prot
+    blastp -query $tx  \
+    -db known_prot  -max_target_seqs 1 \
+    -outfmt 6 -evalue 1e-5 -num_threads ${task.cpus} > blastp.outfmt6
     """
 }
 
 /*
  * STEP N - hmmscan
  */
-process  hmmscane{
-    publishDir "${params.outdir}/hmmer", mode: 'copy'
-    when:
-    false
+// process hmmscan {
+//     publishDir "${params.outdir}/hmmer", mode: 'copy'
+    
+//     input:
+//     file(tx) from longestorf_tx
 
-    script:
-    """
-    hmmscan --cpu 8 --domtblout pfam.domtblout /path/to/Pfam-A.hmm transdecoder_dir/longest_orfs.pep
-    """
-}
+
+//     script:
+//     """
+//     # cpus 8
+//     hmmscan --cpu ${task.cpus} --domtblout pfam.domtblout /path/to/Pfam-A.hmm $tx
+//     """
+// }
 
 /*
 * STEP N -  transdecode Predict
 */
 process transdec_predict {
-    publishDir "${params.outdir}/transdecoder", mode: 'copy'
-    when:
-        false
+    publishDir "${params.outdir}/transdecoder/predict", mode: 'copy'
+    
+    input:
+    file(tx) from tx_unknown2
+    file("predict/*") from longorf_dir.collect()
+    file(fmt) from blastp
+    
+    output:
+    file("predict/*")
 
     script:
     """
-    TransDecoder.Predict -t target_transcripts.fasta --retain_pfam_hits pfam.domtblout --retain_blastp_hits blastp.outfmt6
+    # --retain_pfam_hits pfam
+    TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict
     """
 }
 
@@ -363,11 +407,12 @@ process pasa {
     false
     script:
     """
+    # cpus 8
     cp $PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config 
     Launch_PASA_pipeline.pl \
            -c alignAssembly.config -C -R -g genome_sample.fasta \
            -t all_transcripts.fasta.clean -T -u all_transcripts.fasta \
-           --ALIGNERS blat,gmap --CPU 2
+           --ALIGNERS blat --CPU ${task.cpus}
     """
 }
 
