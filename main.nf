@@ -200,6 +200,7 @@ ${summary.collect { k,v -> "            <dt>$k</dt><dd><samp>${v ?: '<span style
  * STEP N - Atropos
  */
 process trimming {
+    label 'trimming'
     publishDir "${params.outdir}/trimmed", mode: 'copy'
 
     input: 
@@ -210,7 +211,7 @@ process trimming {
 
     script:
     if ( task.cpus > 1 ){
-        threads = "--threads ${tast.cpus}"
+        threads = "--threads ${task.cpus}"
     } else 
     {
         threads = ""
@@ -256,6 +257,7 @@ process merge {
  * STEP N - SPAdes
  */
 process spades {
+    label 'mid_memory'
     publishDir "${params.outdir}", mode: 'copy'
 
     input:
@@ -270,6 +272,7 @@ process spades {
     spades.py --pe1-1 ${reads[0]} \\
               --pe1-2 ${reads[1]} \\
               --rna \\
+              -t ${task.cpus} \\
               -o spades
     """
 }
@@ -278,6 +281,7 @@ process spades {
  * STEP N - Blastp-known
  */
 process blastnt_known {
+    label 'mid_memory'
     publishDir "${params.outdir}/blastn_known", mode: 'copy'
     
     input:
@@ -342,6 +346,7 @@ process transdec_longorf {
  * STEP N - Blastp
  */
 process blastp {
+    label 'mid_memory'
     publishDir "${params.outdir}/blastp", mode: 'copy'
 
     input:
