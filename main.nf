@@ -386,7 +386,7 @@ process blastp {
 */
 process transdec_predict {
     publishDir "${params.outdir}/transdecoder", mode: 'copy'
-    
+
     input:
     file(tx) from tx_unknown2
     file("predict/*") from longorf_dir.collect()
@@ -395,11 +395,13 @@ process transdec_predict {
     output:
     file("*.transdecoder.*")
     file("*.transdecoder.cds") into transdecoder_cds
-
+    file("transcript_unkown_matched_to_prot.fa") into transdecoder_prot
     script:
     """
     # --retain_pfam_hits pfam
     TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict --no_refine_starts
+    select_blastp.py transcript_unkown.fa.transdecoder.bed > matched.txt
+    cat $tx | seqkit grep -v -f matched.txt > transcript_unkown_matched_to_prot.fa
     """
 }
 
@@ -408,28 +410,21 @@ process transdec_predict {
  */
 process pasa {
     publishDir "${params.outdir}/PASA", mode: 'copy'
-    when:
-    false
+    label 'mid_memory'
+
     input:
-    file(gtf) from gtf_stringtieFPKM
-    file(tx) from transdecoder_cds
+    file(tx) from transdecoder_prot
     file(genome) from fasta
 
     output:
-    file("sample_mydb_pasa*")
+    file("blat.spliced_alignments.gff3")
 
     script:
     """
-    # cpus 8
     export PASAHOME=\$(dirname \$(which python))/../opt/pasa-2.3.3
-    cp \$PASAHOME/pasa_conf/pasa.alignAssembly.Template.txt alignAssembly.config
-    awk '{if (\$0~/^>/) {print \$1} else {print \$0}}' $tx > tx.fa
-    \$PASAHOME/bin/seqclean tx.fa
-    \$PASAHOME/Launch_PASA_pipeline.pl \\
-           -L --annots $gtf \\
-           -c alignAssembly.config -C -R -g $genome \\
-           -t tx.fa.clean -T -u tx.fa \\
-           --ALIGNERS blat --CPU ${task.cpus}
+    \$PASAHOME/bin/scripts/run_spliced_aligners.pl --aligners blat \\
+        --genome $genome \\
+        --transcripts $tx -I 5000000 -N 1 --CPU ${task.cpus}
     """
 }
 
