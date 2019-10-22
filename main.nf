@@ -28,16 +28,17 @@ def helpMessage() {
 
     Options:
       --genome                      Name of iGenomes reference
-      --singleEnd                   Specifies that the input is single end reads
 
     References                      If not specified in the configuration file or you wish to overwrite any of the references.
       --genome                      Name of iGenomes reference
+      --hisat2_index                Path to HiSAT2 index
       --fasta                       Path to genome fasta file
       --gtf                         Path to GTF file
       --proteins                    ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
       --saveReference               Save the generated reference files to the results directory
       --compressedReference         If provided, all reference files are assumed to be gzipped and will be unzipped before using
-    
+      --skipAlignment               Skip alignment altogether
+
     Strandedness:
       --forwardStranded             The library is forward stranded
       --reverseStranded             The library is reverse stranded
@@ -73,17 +74,12 @@ if (params.genomes && params.genome && !params.genomes.containsKey(params.genome
 // TODO nf-core: Add any reference files that are needed
 // Configurable reference genomes
 fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
+params.hisat2_index = params.genome ? params.genomes[ params.genome ].hisat2 ?: false : false
+
 if ( params.fasta ){
     fasta = file(params.fasta)
     if( !fasta.exists() ) exit 1, "Fasta file not found: ${params.fasta}"
 }
-//
-// NOTE - THIS IS NOT USED IN THIS PIPELINE, EXAMPLE ONLY
-// If you want to use the above in a process, define the following:
-//   input:
-//   file fasta from fasta
-//
-
 
 // Has the run name been specified by the user?
 //  this has the bonus effect of catching both -name and --name
@@ -123,11 +119,10 @@ if(params.readPaths){
         .into { ch_trimming }
 }
 
-
 Channel
     .fromPath(params.gtf, checkIfExists: true)
     .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
-    .into { gtf_stringtieFPKM }
+    .into { gtf_stringtieFPKM; gtf_makeHisatSplicesites }
 
 Channel
     .fromPath(params.tx, checkIfExists: true)
@@ -196,37 +191,45 @@ ${summary.collect { k,v -> "            <dt>$k</dt><dd><samp>${v ?: '<span style
 }
 
 
-/*
- * STEP N - Atropos
- */
-process trimming {
-    label 'trimming'
-    publishDir "${params.outdir}/trimmed", mode: 'copy'
+if (!params.skipTrimming){
 
-    input: 
-    set val(name), file(reads) from ch_trimming
+    /*
+    * STEP N - Atropos
+    */
+    process trimming {
+        label 'trimming'
+        publishDir "${params.outdir}/trimmed", mode: 'copy'
 
-    output:
-    set val(name), file("*fq.gz") into ch_fastq1, ch_fastq2
+        input: 
+        set val(name), file(reads) from ch_trimming
 
-    script:
-    if ( task.cpus > 1 ){
-        threads = "--threads ${task.cpus}"
-    } else 
-    {
-        threads = ""
+        output:
+        set val(name), file("*fq.gz") into ch_fastq1, ch_fastq2
+
+        script:
+        if ( task.cpus > 1 ){
+            threads = "--threads ${task.cpus}"
+        } else 
+        {
+            threads = ""
+        }
+        """
+        atropos $threads -a AGATCGGAAGAGC  -a AAAAAAAAA \\
+                -A AGATCGGAAGAGC -A TTTTTTTTTTTT \\
+                --minimum-length 50 \\
+                -q 20 \\
+                --trim-n \\
+                -o $name.1.fq.gz -p $name.2.fq.gz \\
+                -pe1 ${reads[0]} -pe2 ${reads[1]}
+
+        """
     }
-    """
-    atropos $threads -a AGATCGGAAGAGC  -a AAAAAAAAA \\
-            -A AGATCGGAAGAGC -A TTTTTTTTTTTT \\
-            --minimum-length 50 \\
-            -q 20 \\
-            --trim-n \\
-            -o $name.1.fq.gz -p $name.2.fq.gz \\
-            -pe1 ${reads[0]} -pe2 ${reads[1]}
 
-    """
+}else{
+   ch_trimming
+       .into {ch_fastq1; ch_fastq1}
 }
+
 
 ch_fastq1
     .map {sample -> sample[1][0]}
@@ -245,11 +248,22 @@ process merge {
 
     output:
     file("*fq.gz") into ch_fq_merged
+    file("*fq.gz") into ch_fq_merged2bam
 
     script:
     """
-    zcat $reads1 | gzip > reads.1.fq.gz
-    zcat $reads2 | gzip > reads.2.fq.gz
+    merge(){ \\
+        I=\$1 \\
+        \\
+        shift \\
+        if [[  \$# -eq 1  ]]; then  \\
+            ln -s \$@ $I  \\
+        else  \\
+            zcat \$@ | gzip > $I  \\
+        fi  \\
+    }  \\
+    merge reads.1.fq.gz $reads1
+    merge reads.2.fq.gz $reads2
     """
 }
 
@@ -320,7 +334,6 @@ process blastnt_parse {
     cat $cds | seqkit grep -v -f transcript_unkown > transcript_unkown.fa
     """
 }
-
 
 /*
  * STEP N - TransDecoder.longORF
@@ -428,6 +441,197 @@ process pasa {
     """
 }
 
+
+/*
+* PREPROCESSING - Build HISAT2 splice sites file
+*/
+if(!params.skipAlignment){
+    process makeHisatSplicesites {
+        tag "$gtf"
+        publishDir path: { params.saveReference ? "${params.outdir}/reference_genome" : params.outdir },
+                    saveAs: { params.saveReference ? it : null }, mode: 'copy'
+
+        input:
+        file gtf from gtf_makeHisatSplicesites
+
+        output:
+        file "${gtf.baseName}.hisat2_splice_sites.txt" into indexing_splicesites, alignment_splicesites
+
+        script:
+        """
+        hisat2_extract_splice_sites.py $gtf > ${gtf.baseName}.hisat2_splice_sites.txt
+        """
+    }
+}
+
+/*
+* PREPROCESSING - Build HISAT2 index
+*/
+if(!params.skipAlignment && !params.hisat2_index && params.fasta){
+    process makeHISATindex {
+        tag "$fasta"
+        publishDir path: { params.saveReference ? "${params.outdir}/reference_genome" : params.outdir },
+                    saveAs: { params.saveReference ? it : null }, mode: 'copy'
+
+        input:
+        file fasta from ch_fasta_for_hisat_index
+        file indexing_splicesites from indexing_splicesites
+        file gtf from gtf_makeHISATindex
+
+        output:
+        file "${fasta.baseName}.*.ht2*" into hs2_indices
+
+        script:
+        if( !task.memory ){
+            log.info "[HISAT2 index build] Available memory not known - defaulting to 0. Specify process memory requirements to change this."
+            avail_mem = 0
+        } else {
+            log.info "[HISAT2 index build] Available memory: ${task.memory}"
+            avail_mem = task.memory.toGiga()
+        }
+        if( avail_mem > params.hisat_build_memory ){
+            log.info "[HISAT2 index build] Over ${params.hisat_build_memory} GB available, so using splice sites and exons in HISAT2 index"
+            extract_exons = "hisat2_extract_exons.py $gtf > ${gtf.baseName}.hisat2_exons.txt"
+            ss = "--ss $indexing_splicesites"
+            exon = "--exon ${gtf.baseName}.hisat2_exons.txt"
+        } else {
+            log.info "[HISAT2 index build] Less than ${params.hisat_build_memory} GB available, so NOT using splice sites and exons in HISAT2 index."
+            log.info "[HISAT2 index build] Use --hisat_build_memory [small number] to skip this check."
+            extract_exons = ''
+            ss = ''
+            exon = ''
+        }
+        """
+        $extract_exons
+        hisat2-build -p ${task.cpus} $ss $exon $fasta ${fasta.baseName}.hisat2_index
+        """
+    }
+}
+
+/*
+* STEP 3 - align with HISAT2
+*/
+if(!params.skipAlignment){
+    star_log = Channel.from(false)
+    process hisat2Align {
+        label 'high_memory'
+        publishDir "${params.outdir}/HISAT2", mode: 'copy',
+            saveAs: {filename ->
+                if (filename.indexOf(".hisat2_summary.txt") > 0) "logs/$filename"
+                else if (!params.saveAlignedIntermediates && filename == "where_are_my_files.txt") filename
+                else if (params.saveAlignedIntermediates && filename != "where_are_my_files.txt") filename
+                else null
+            }
+
+        input:
+        file reads from ch_fq_merged2bam
+        file hs2_indices from hs2_indices.collect()
+        file alignment_splicesites from alignment_splicesites.collect()
+        file wherearemyfiles from ch_where_hisat2.collect()
+
+        output:
+        file "${prefix}.bam" into hisat2_bam
+        file "${prefix}.hisat2_summary.txt" into alignment_logs
+        file "where_are_my_files.txt"
+        file "unmapped.hisat2*" optional true
+
+        script:
+        index_base = hs2_indices[0].toString() - ~/.\d.ht2l?/
+        prefix = reads[0].toString() - ~/(_R1)?(_trimmed)?(_val_1)?(\.fq)?(\.fastq)?(\.gz)?$/
+        def rnastrandness = ''
+        if (forwardStranded && !unStranded){
+            rnastrandness = params.singleEnd ? '--rna-strandness F' : '--rna-strandness FR'
+        } else if (reverseStranded && !unStranded){
+            rnastrandness = params.singleEnd ? '--rna-strandness R' : '--rna-strandness RF'
+        }
+        
+
+        unaligned = params.saveUnaligned ? "--un-conc-gz unmapped.hisat2.gz" : ''
+        """
+        hisat2 -x $index_base \\
+                -1 ${reads[0]} \\
+                -2 ${reads[1]} \\
+                $rnastrandness \\
+                --known-splicesite-infile $alignment_splicesites \\
+                --no-mixed \\
+                --no-discordant \\
+                -p ${task.cpus} $unaligned\\
+                --met-stderr \\
+                --new-summary \\
+                --dta \\
+                --summary-file ${prefix}.hisat2_summary.txt \\
+                | samtools view -bS -F 4 -F 8 -F 256 - > ${prefix}.bam
+        """
+    }
+
+    process hisat2_sortOutput {
+        label 'mid_memory'
+        tag "${hisat2_bam.baseName}"
+        publishDir "${params.outdir}/HISAT2", mode: 'copy'
+
+        input:
+        file hisat2_bam
+
+        output:
+        file "${hisat2_bam.baseName}.sorted.bam" into bam_stringtieFPKM
+        file "${hisat2_bam.baseName}.sorted.bam.bai" into bam_index
+
+        script:
+        def suff_mem = ("${(task.memory.toBytes() - 6000000000) / task.cpus}" > 2000000000) ? 'true' : 'false'
+        def avail_mem = (task.memory && suff_mem) ? "-m" + "${(task.memory.toBytes() - 6000000000) / task.cpus}" : ''
+        """
+        samtools sort \\
+            $hisat2_bam \\
+            -@ ${task.cpus} ${avail_mem} \\
+            -o ${hisat2_bam.baseName}.sorted.bam
+        samtools index ${hisat2_bam.baseName}.sorted.bam
+        """
+    }
+}
+
+/*
+* STEP 12 - stringtie FPKM
+*/
+process stringtieFPKM {
+    label 'mid_memory'
+    tag "${name - '.sorted'}"
+    publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
+        saveAs: {filename ->
+            if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
+            else if (filename.indexOf("cov_refs.gtf") > 0) "cov_refs/$filename"
+            else "$filename"
+        }
+
+    input:
+    set val(name), file(bam) from bam_stringtieFPKM
+    file gtf from gtf_stringtieFPKM.collect()
+
+    output:
+    file "${name}_transcripts.gtf"
+    file "${name}_merged_transcripts.gtf" into stringtieGTF 
+    file "${name}.gene_abund.txt"
+    file "${name}.cov_refs.gtf"
+
+    script:
+    def st_direction = ''
+    if (forwardStranded && !unStranded){
+        st_direction = "--fr"
+    } else if (reverseStranded && !unStranded){
+        st_direction = "--rf"
+    }
+    """
+    stringtie $bam \\
+        $st_direction \\
+        -o ${name}_transcripts.gtf \\
+        -v \\
+        -G $gtf \\
+        -A ${name}.gene_abund.txt \\
+        -C ${name}.cov_refs.gtf
+    stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
+    """
+}
+
+
 /*
  * STEP N - MultiQC
  */
@@ -457,7 +661,6 @@ process multiqc {
 }
 
 
-
 /*
  * STEP 3 - Output Description HTML
  */
@@ -475,7 +678,6 @@ process output_documentation {
     markdown_to_html.r $output_docs results_description.html
     """
 }
-
 
 
 /*
