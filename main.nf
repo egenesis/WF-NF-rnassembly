@@ -36,8 +36,11 @@ def helpMessage() {
       --gtf                         Path to GTF file
       --proteins                    ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
       --saveReference               Save the generated reference files to the results directory
-      --compressedReference         If provided, all reference files are assumed to be gzipped and will be unzipped before using
       --skipAlignment               Skip alignment altogether
+      --saveAlignedIntermediates
+      --skipTrimming
+      --skipSpades
+      --tx_assembled
 
     Strandedness:
       --forwardStranded             The library is forward stranded
@@ -60,10 +63,15 @@ def helpMessage() {
  * SET UP CONFIGURATION VARIABLES
  */
 
-// Show help emssage
+// Show help message
 if (params.help){
     helpMessage()
     exit 0
+}
+
+//Check incompatible parameters
+if (params.skipSpades && !params.tx_assembled){
+    exit 1, "You need to provide a FASTA files with assembled transcriptome if you want to skip Spades."
 }
 
 // Check if genome exists in the config file
@@ -76,10 +84,10 @@ if (params.genomes && params.genome && !params.genomes.containsKey(params.genome
 fasta = params.genome ? params.genomes[ params.genome ].fasta ?: false : false
 params.hisat2_index = params.genome ? params.genomes[ params.genome ].hisat2 ?: false : false
 
-if ( params.fasta ){
-    fasta = file(params.fasta)
-    if( !fasta.exists() ) exit 1, "Fasta file not found: ${params.fasta}"
-}
+Channel.fromPath(params.fasta, checkIfExists: true)
+    .ifEmpty { exit 1, "Genome fasta file not found: ${params.fasta}" }
+    .into { ch_fasta_for_hisat_index; fasta }
+
 
 // Has the run name been specified by the user?
 //  this has the bonus effect of catching both -name and --name
@@ -106,6 +114,7 @@ ch_output_docs = Channel.fromPath("$baseDir/docs/output.md")
 /*
  * Create a channel for input read files
  */
+
 if(params.readPaths){
         Channel
             .from(params.readPaths)
@@ -122,7 +131,7 @@ if(params.readPaths){
 Channel
     .fromPath(params.gtf, checkIfExists: true)
     .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
-    .into { gtf_stringtieFPKM; gtf_makeHisatSplicesites }
+    .into { gtf_stringtieFPKM; gtf_makeHisatSplicesites; gtf_makeHISATindex }
 
 Channel
     .fromPath(params.tx, checkIfExists: true)
@@ -132,8 +141,10 @@ Channel
 Channel
     .fromPath(params.proteins, checkIfExists: true)
     .ifEmpty { exit 1, "Proteins fasta file not found: ${params.proteins}" }
-    .into { prot_fasta }
+    .into { prot_fasta; prot_fasta_ann; prot_fasta_qc }
 
+Channel.fromPath("$baseDir/assets/where_are_my_files.txt", checkIfExists: true)
+       .into{ch_where_hisat2; ch_where_hisat2_sort}
 
 forwardStranded = params.forwardStranded
 reverseStranded = params.reverseStranded
@@ -198,7 +209,7 @@ if (!params.skipTrimming){
     */
     process trimming {
         label 'trimming'
-        publishDir "${params.outdir}/trimmed", mode: 'copy'
+        
 
         input: 
         set val(name), file(reads) from ch_trimming
@@ -242,6 +253,9 @@ ch_fastq2
     .set { ch_fastq_r2}
 
 process merge {
+    label 'merge'
+    publishDir "${params.outdir}/trimmed", mode: 'copy'
+    
     input: 
     file(reads1) from ch_fastq_r1.collect()
     file(reads2) from ch_fastq_r2.collect()
@@ -252,16 +266,17 @@ process merge {
 
     script:
     """
-    merge(){ \\
-        I=\$1 \\
-        \\
-        shift \\
-        if [[  \$# -eq 1  ]]; then  \\
-            ln -s \$@ $I  \\
-        else  \\
-            zcat \$@ | gzip > $I  \\
-        fi  \\
-    }  \\
+    merge(){ 
+        I=\$1 
+        
+        shift 
+        if [ \$# -eq 1 ] 
+        then  
+            ln -s \$@ \$I  
+        else  
+            zcat \$@ | gzip > \$I  
+        fi  
+    }  
     merge reads.1.fq.gz $reads1
     merge reads.2.fq.gz $reads2
     """
@@ -270,26 +285,37 @@ process merge {
 /*
  * STEP N - SPAdes
  */
-process spades {
-    label 'mid_memory'
-    publishDir "${params.outdir}", mode: 'copy'
+if (!params.skipSpades){
+    process spades {
+        label 'mid_memory'
+        publishDir "${params.outdir}", mode: 'copy'
 
-    input:
-    file(reads) from ch_fq_merged
+        input:
+        file(reads) from ch_fq_merged
 
-    output:
-    file("spades/*") into spades_output
-    file("spades/transcripts.fasta") into spades2blastn_tx
+        output:
+        file("spades/*") into spades_output
+        file("spades/transcripts.fasta") into spades2blastn_tx, spades2qc
 
-    script:
-    """
-    spades.py --pe1-1 ${reads[0]} \\
-              --pe1-2 ${reads[1]} \\
-              --rna \\
-              -t ${task.cpus} \\
-              -o spades
-    """
+        script:
+        """
+        spades.py --pe1-1 ${reads[0]} \\
+                --pe1-2 ${reads[1]} \\
+                --rna \\
+                -t ${task.cpus} \\
+                -o spades
+        """
+    }
+} else {
+    Channel
+        .fromPath(params.tx_assembled, checkIfExists: true)
+        .ifEmpty { exit 1, "tx assembled file not found: ${params.gtf}" }
+        .into { spades2blastn_tx; spades2qc }
+
 }
+
+
+// # TODO: create process to get transripts from GTF  + genome to get all possible known RNA
 
 /*
  * STEP N - Blastp-known
@@ -303,7 +329,7 @@ process blastnt_known {
     file(tx) from tx_fasta
 
     output:
-    file("blastn.known.outfmt6") into blastn_known
+    file("blastn.known.outfmt6") into blastn_known, blastn2qc
 
     script:
     """
@@ -325,13 +351,12 @@ process blastnt_parse {
     file(outfmt) from blastn_known
 
     output:
-    file("transcript_unkown.fa") into tx_unknown1
-    file("transcript_unkown.fa") into tx_unknown2
+    file "transcript_unknown.fa" into tx_unknown1, tx_unknown2
 
     script:
     """
-    clean_blastnt.py $outfmt > transcript_unkown
-    cat $cds | seqkit grep -v -f transcript_unkown > transcript_unkown.fa
+    clean_blastnt.py $outfmt > transcript_unknown
+    cat $cds | seqkit grep -v -f transcript_unknown > transcript_unknown.fa
     """
 }
 
@@ -346,7 +371,7 @@ process transdec_longorf {
 
     output:
     file("transcripts.fasta.transdecoder_dir/*") into longorf_dir
-    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx
+    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx, tdlong2qc
 
     script:
     """
@@ -367,7 +392,7 @@ process blastp {
     file(tx) from longestorf_tx
 
     output:
-    file("blastp.outfmt6") into blastp
+    file("blastp.outfmt6") into blastp, blastp2qc
     script:
     """
     makeblastdb -in $prot -input_type fasta -dbtype prot -parse_seqids -out known_prot
@@ -407,14 +432,14 @@ process transdec_predict {
     
     output:
     file("*.transdecoder.*")
-    file("*.transdecoder.cds") into transdecoder_cds
-    file("transcript_unkown_matched_to_prot.fa") into transdecoder_prot
+    file("transcript_unknown.fa.transdecoder.bed") into transdecoder_bed, tdpredict2qc
+    file("transcript_matched_to_prot.fa") into transdecoder_prot
     script:
     """
     # --retain_pfam_hits pfam
     TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict --no_refine_starts
-    select_blastp.py transcript_unkown.fa.transdecoder.bed > matched.txt
-    cat $tx | seqkit grep -v -f matched.txt > transcript_unkown_matched_to_prot.fa
+    select_blastp.py transcript_unknown.fa.transdecoder.bed > matched.txt
+    cat $tx | seqkit grep -f matched.txt > transcript_matched_to_prot.fa
     """
 }
 
@@ -430,17 +455,37 @@ process pasa {
     file(genome) from fasta
 
     output:
-    file("blat.spliced_alignments.gff3")
+    file("blat.spliced_alignments.gff3") into pasa_gff3
 
     script:
     """
     export PASAHOME=\$(dirname \$(which python))/../opt/pasa-2.3.3
-    \$PASAHOME/bin/scripts/run_spliced_aligners.pl --aligners blat \\
+    \$PASAHOME/scripts/run_spliced_aligners.pl --aligners blat \\
         --genome $genome \\
         --transcripts $tx -I 5000000 -N 1 --CPU ${task.cpus}
     """
 }
 
+/*
+ * STEP N - ANN PASA
+ */
+process annotation {
+    publishDir "${params.outdir}/PASA", mode: 'copy'
+    label 'mid_memory'
+
+    input:
+    file(bed) from transdecoder_bed
+    file(pasa) from pasa_gff3
+    file(protein) from prot_fasta_ann
+
+    output:
+    file("novel_with_function.gff3") into pasa2qc
+
+    script:
+    """
+    gfftools.py $pasa $bed $protein > novel_with_function.gff3
+    """
+}
 
 /*
 * PREPROCESSING - Build HISAT2 splice sites file
@@ -509,7 +554,7 @@ if(!params.skipAlignment && !params.hisat2_index && params.fasta){
 }
 
 /*
-* STEP 3 - align with HISAT2
+* STEP N - align with HISAT2
 */
 if(!params.skipAlignment){
     star_log = Channel.from(false)
@@ -524,7 +569,7 @@ if(!params.skipAlignment){
             }
 
         input:
-        file reads from ch_fq_merged2bam
+        file(reads) from ch_fq_merged2bam
         file hs2_indices from hs2_indices.collect()
         file alignment_splicesites from alignment_splicesites.collect()
         file wherearemyfiles from ch_where_hisat2.collect()
@@ -540,13 +585,13 @@ if(!params.skipAlignment){
         prefix = reads[0].toString() - ~/(_R1)?(_trimmed)?(_val_1)?(\.fq)?(\.fastq)?(\.gz)?$/
         def rnastrandness = ''
         if (forwardStranded && !unStranded){
-            rnastrandness = params.singleEnd ? '--rna-strandness F' : '--rna-strandness FR'
+            rnastrandness = '--rna-strandness FR'
         } else if (reverseStranded && !unStranded){
             rnastrandness = params.singleEnd ? '--rna-strandness R' : '--rna-strandness RF'
         }
         
 
-        unaligned = params.saveUnaligned ? "--un-conc-gz unmapped.hisat2.gz" : ''
+        unaligned = "--un-conc-gz unmapped.hisat2.gz" 
         """
         hisat2 -x $index_base \\
                 -1 ${reads[0]} \\
@@ -587,14 +632,12 @@ if(!params.skipAlignment){
         samtools index ${hisat2_bam.baseName}.sorted.bam
         """
     }
-}
 
-/*
-* STEP 12 - stringtie FPKM
+    /*
+* STEP N - stringtie FPKM
 */
 process stringtieFPKM {
     label 'mid_memory'
-    tag "${name - '.sorted'}"
     publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
         saveAs: {filename ->
             if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
@@ -602,15 +645,16 @@ process stringtieFPKM {
             else "$filename"
         }
 
+
     input:
-    set val(name), file(bam) from bam_stringtieFPKM
+    file(bam) from bam_stringtieFPKM
     file gtf from gtf_stringtieFPKM.collect()
 
     output:
-    file "${name}_transcripts.gtf"
-    file "${name}_merged_transcripts.gtf" into stringtieGTF 
-    file "${name}.gene_abund.txt"
-    file "${name}.cov_refs.gtf"
+    file "*_transcripts.gtf"
+    file "*_merged_transcripts.gtf" into stringtieGTF 
+    file "*.gene_abund.txt"
+    file "*.cov_refs.gtf"
 
     script:
     def st_direction = ''
@@ -619,6 +663,8 @@ process stringtieFPKM {
     } else if (reverseStranded && !unStranded){
         st_direction = "--rf"
     }
+    name = bam.toString() - ~/(_R1)?(_trimmed)?(\.sorted\.bam)?(\.fq)?(\.fastq)?(\.gz)?$/
+
     """
     stringtie $bam \\
         $st_direction \\
@@ -628,6 +674,36 @@ process stringtieFPKM {
         -A ${name}.gene_abund.txt \\
         -C ${name}.cov_refs.gtf
     stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
+    """
+}
+
+}
+
+/*
+ * STEP N - QC
+ */
+process qc {
+    publishDir "${params.outdir}/QC", mode: 'copy'
+    label 'mid_memory'
+
+    when:
+    false
+
+    input:
+    file(tx) from spades2qc
+    file(blastn) from blastn2qc
+    file(txlong) from tdlong2qc
+    file(blastp) from blastp2qc
+    file(bed) from tdpredict2qc
+    file(pasa) from pasa2qc
+    file(protein) from prot_fasta_qc
+
+    output:
+    file("assembly_qc.db") into pasa2qc
+
+    script:
+    """
+    make_db.py $prot_fasta_qc $spades2qc $blastn2qc $tdlong2qc $blastp2qc $tdpredict2qc $pasa2qc
     """
 }
 
@@ -645,6 +721,7 @@ process multiqc {
     // TODO nf-core: Add in log files from your new processes for MultiQC to find!
     //file ('software_versions/*') from software_versions_yaml.collect()
     file workflow_summary from create_workflow_summary(summary)
+    file ('alignment/*') from alignment_logs.collect().ifEmpty([])
 
     output:
     file "*multiqc_report.html" into multiqc_report
@@ -656,7 +733,7 @@ process multiqc {
     rfilename = custom_runName ? "--filename " + custom_runName.replaceAll('\\W','_').replaceAll('_+','_') + "_multiqc_report" : ''
     // TODO nf-core: Specify which MultiQC modules to use with -m for a faster run time
     """
-    multiqc -f $rtitle $rfilename --config $multiqc_config .
+    multiqc -f $rtitle $rfilename --config $multiqc_config -m hisat2 .
     """
 }
 
