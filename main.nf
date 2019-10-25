@@ -146,6 +146,14 @@ Channel
 Channel.fromPath("$baseDir/assets/where_are_my_files.txt", checkIfExists: true)
        .into{ch_where_hisat2; ch_where_hisat2_sort}
 
+if ( params.hisat2_index && !params.skipAlignment ){
+
+    hs2_indices = Channel
+        .fromPath("${params.hisat2_index}*", checkIfExists: true)
+        .ifEmpty { exit 1, "HISAT2 index not found: ${params.hisat2_index}" }
+
+}
+
 forwardStranded = params.forwardStranded
 reverseStranded = params.reverseStranded
 unStranded = params.unStranded
@@ -238,7 +246,7 @@ if (!params.skipTrimming){
 
 }else{
    ch_trimming
-       .into {ch_fastq1; ch_fastq1}
+       .into {ch_fastq1; ch_fastq2}
 }
 
 
@@ -253,7 +261,6 @@ ch_fastq2
     .set { ch_fastq_r2}
 
 process merge {
-    label 'merge'
     publishDir "${params.outdir}/trimmed", mode: 'copy'
     
     input: 
@@ -261,9 +268,8 @@ process merge {
     file(reads2) from ch_fastq_r2.collect()
 
     output:
-    file("*fq.gz") into ch_fq_merged
-    file("*fq.gz") into ch_fq_merged2bam
-
+    file "mreads*fq.gz" into ch_fq_merged, ch_fq_merged2bam
+ 
     script:
     """
     merge(){ 
@@ -277,8 +283,8 @@ process merge {
             zcat \$@ | gzip > \$I  
         fi  
     }  
-    merge reads.1.fq.gz $reads1
-    merge reads.2.fq.gz $reads2
+    merge mreads.1.fq.gz $reads1
+    merge mreads.2.fq.gz $reads2
     """
 }
 
@@ -294,8 +300,8 @@ if (!params.skipSpades){
         file(reads) from ch_fq_merged
 
         output:
-        file("spades/*") into spades_output
-        file("spades/transcripts.fasta") into spades2blastn_tx, spades2qc
+        file "spades/*" into spades_output
+        file "spades/transcripts.fasta" into spades2blastn_tx, spades2blastn2parser, spades2qc
 
         script:
         """
@@ -310,7 +316,7 @@ if (!params.skipSpades){
     Channel
         .fromPath(params.tx_assembled, checkIfExists: true)
         .ifEmpty { exit 1, "tx assembled file not found: ${params.gtf}" }
-        .into { spades2blastn_tx; spades2qc }
+        .into { spades2blastn_tx; spades2blastn2parser; spades2qc }
 
 }
 
@@ -329,7 +335,7 @@ process blastnt_known {
     file(tx) from tx_fasta
 
     output:
-    file("blastn.known.outfmt6") into blastn_known, blastn2qc
+    file "blastn.known.outfmt6" into blastn_known, blastn2qc
 
     script:
     """
@@ -347,7 +353,7 @@ process blastnt_parse {
     publishDir "${params.outdir}/blastn_known", mode: 'copy'
     
     input:
-    file(cds) from spades2blastn_tx
+    file(cds) from spades2blastn2parser
     file(outfmt) from blastn_known
 
     output:
@@ -371,7 +377,7 @@ process transdec_longorf {
 
     output:
     file("transcripts.fasta.transdecoder_dir/*") into longorf_dir
-    file("transcripts.fasta.transdecoder_dir/longest_orfs.pep") into longestorf_tx, tdlong2qc
+    file "transcripts.fasta.transdecoder_dir/longest_orfs.pep" into longestorf_tx, tdlong2qc
 
     script:
     """
@@ -392,7 +398,7 @@ process blastp {
     file(tx) from longestorf_tx
 
     output:
-    file("blastp.outfmt6") into blastp, blastp2qc
+    file "blastp.outfmt6" into blastp, blastp2qc
     script:
     """
     makeblastdb -in $prot -input_type fasta -dbtype prot -parse_seqids -out known_prot
@@ -432,7 +438,7 @@ process transdec_predict {
     
     output:
     file("*.transdecoder.*")
-    file("transcript_unknown.fa.transdecoder.bed") into transdecoder_bed, tdpredict2qc
+    file "transcript_unknown.fa.transdecoder.bed" into transdecoder_bed, tdpredict2qc
     file("transcript_matched_to_prot.fa") into transdecoder_prot
     script:
     """
@@ -484,6 +490,7 @@ process annotation {
     script:
     """
     gfftools.py $pasa $bed $protein > novel_with_function.gff3
+    gffread --keep-genes -E -T --keep-exon-attrs -F novel_with_function.gff3 > novel_with_function.gtf
     """
 }
 
@@ -699,7 +706,7 @@ process qc {
     file(protein) from prot_fasta_qc
 
     output:
-    file("assembly_qc.db") into pasa2qc
+    file "assembly_qc.db" into qc
 
     script:
     """
