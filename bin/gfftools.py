@@ -64,10 +64,11 @@ for f in db.all_features(order_by=('seqid', 'attributes', 'start')):
         exon_idx = 1
     if node in mapper:
         f.attributes['protein_id'] = mapper[node]
-        if mapper[node] in genes:
-            f.attributes['gene_name'] = genes[mapper[node]]
-        f.attributes['exon_id'] = "E" + f.attributes['gene_id'][0] + "." + str(exon_idx)
-        f.attributes['exon_number'] = [str(exon_idx)]
+    f.attributes['gene_name'] = node
+    if mapper[node] in genes:
+        f.attributes['gene_name'] = genes[mapper[node]]
+    f.attributes['exon_id'] = "E" + f.attributes['gene_id'][0] + "." + str(exon_idx)
+    f.attributes['exon_number'] = [str(exon_idx)]
     exon_idx += 1
     updated.append(f)
 

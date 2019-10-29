@@ -34,6 +34,7 @@ def helpMessage() {
       --hisat2_index                Path to HiSAT2 index
       --fasta                       Path to genome fasta file
       --gtf                         Path to GTF file
+      --ucsc_gtf                        GTF files from UCSC alignment (custom made)
       --proteins                    ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
       --saveReference               Save the generated reference files to the results directory
       --skipAlignment               Skip alignment altogether
@@ -131,7 +132,7 @@ if(params.readPaths){
 Channel
     .fromPath(params.gtf, checkIfExists: true)
     .ifEmpty { exit 1, "GTF annotation file not found: ${params.gtf}" }
-    .into { gtf_stringtieFPKM; gtf_makeHisatSplicesites; gtf_makeHISATindex }
+    .into { gtf_stringtieFPKM; gtf_makeHisatSplicesites; gtf_makeHISATindex; gtf_unify }
 
 Channel
     .fromPath(params.tx, checkIfExists: true)
@@ -142,6 +143,11 @@ Channel
     .fromPath(params.proteins, checkIfExists: true)
     .ifEmpty { exit 1, "Proteins fasta file not found: ${params.proteins}" }
     .into { prot_fasta; prot_fasta_ann; prot_fasta_qc }
+
+Channel
+    .fromPath(params.ucsc_gtf, checkIfExists: true)
+    .ifEmpty { exit 1, "UCSC GTF file not found: ${params.ucsc}" }
+    .into {ucsc2unify}
 
 Channel.fromPath("$baseDir/assets/where_are_my_files.txt", checkIfExists: true)
        .into{ch_where_hisat2; ch_where_hisat2_sort}
@@ -439,13 +445,13 @@ process transdec_predict {
     output:
     file("*.transdecoder.*")
     file "transcript_unknown.fa.transdecoder.bed" into transdecoder_bed, tdpredict2qc
-    file("transcript_matched_to_prot.fa") into transdecoder_prot
+    file("transcript_with_function.fa") into transdecoder_prot
     script:
     """
     # --retain_pfam_hits pfam
     TransDecoder.Predict -t $tx  --retain_blastp_hits $fmt -O predict --no_refine_starts
     select_blastp.py transcript_unknown.fa.transdecoder.bed > matched.txt
-    cat $tx | seqkit grep -f matched.txt > transcript_matched_to_prot.fa
+    cat $tx | seqkit grep -f matched.txt > transcript_with_function.fa
     """
 }
 
@@ -461,14 +467,16 @@ process pasa {
     file(genome) from fasta
 
     output:
-    file("blat.spliced_alignments.gff3") into pasa_gff3
+    file("*.gff3") into pasa_gff3
 
     script:
+    prefix = tx.toString() - ~/(\.fa)?(\.fasta)?(\.gz)?$/
     """
     export PASAHOME=\$(dirname \$(which python))/../opt/pasa-2.3.3
     \$PASAHOME/scripts/run_spliced_aligners.pl --aligners blat \\
         --genome $genome \\
         --transcripts $tx -I 5000000 -N 1 --CPU ${task.cpus}
+    mv blat.spliced_alignments.gff3 ${prefix}.gff3
     """
 }
 
@@ -485,12 +493,13 @@ process annotation {
     file(protein) from prot_fasta_ann
 
     output:
-    file("novel_with_function.gff3") into pasa2qc
+    file "*.gtf" into pasa2unify, pasa2qc
 
     script:
+    prefix = pasa.toString() - ~/(\.fa)?(\.fasta)?(\.gz)?$/
     """
-    gfftools.py $pasa $bed $protein > novel_with_function.gff3
-    gffread --keep-genes -E -T --keep-exon-attrs -F novel_with_function.gff3 > novel_with_function.gtf
+    gfftools.py $pasa $bed $protein > ${prefix}.gff3
+    gffread --keep-genes -E -T --keep-exon-attrs -F ${prefix}.gff3 > ${prefix}.gtf
     """
 }
 
@@ -641,50 +650,81 @@ if(!params.skipAlignment){
     }
 
     /*
-* STEP N - stringtie FPKM
-*/
-process stringtieFPKM {
-    label 'mid_memory'
-    publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
-        saveAs: {filename ->
-            if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
-            else if (filename.indexOf("cov_refs.gtf") > 0) "cov_refs/$filename"
-            else "$filename"
-        }
+    * STEP N - stringtie FPKM
+    */
+    process stringtieFPKM {
+        label 'mid_memory'
+        publishDir "${params.outdir}/stringtieFPKM", mode: 'copy',
+            saveAs: {filename ->
+                if (filename.indexOf("transcripts.gtf") > 0) "transcripts/$filename"
+                else if (filename.indexOf("cov_refs.gtf") > 0) "cov_refs/$filename"
+                else "$filename"
+            }
 
+
+        input:
+        file(bam) from bam_stringtieFPKM
+        file gtf from gtf_stringtieFPKM.collect()
+
+        output:
+        file "*_transcripts.gtf"
+        file "*_merged_transcripts.gtf" into stringtieGTF 
+        file "*.gene_abund.txt"
+        file "*.cov_refs.gtf"
+
+        script:
+        def st_direction = ''
+        if (forwardStranded && !unStranded){
+            st_direction = "--fr"
+        } else if (reverseStranded && !unStranded){
+            st_direction = "--rf"
+        }
+        name = bam.toString() - ~/(_R1)?(_trimmed)?(\.sorted\.bam)?(\.fq)?(\.fastq)?(\.gz)?$/
+
+        """
+        stringtie $bam \\
+            $st_direction \\
+            -o ${name}_transcripts.gtf \\
+            -v \\
+            -G $gtf \\
+            -A ${name}.gene_abund.txt \\
+            -C ${name}.cov_refs.gtf
+        stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
+        """
+    }
+
+}
+
+/*
+ * STEP N - Unify
+ */
+ process unify {
+    publishDir "${params.outdir}/unify", mode: 'copy'
 
     input:
-    file(bam) from bam_stringtieFPKM
-    file gtf from gtf_stringtieFPKM.collect()
+    file tx from gtf_unify
+    // stringtie
+    file stie from stringtieGTF
+    // blat
+    file spades from pasa2unify
+    // ucsc
+    file ucsc from ucsc2unify
 
     output:
-    file "*_transcripts.gtf"
-    file "*_merged_transcripts.gtf" into stringtieGTF 
-    file "*.gene_abund.txt"
-    file "*.cov_refs.gtf"
+    file "novel.gtf"
+    file "complete_sorted.gtf"
 
     script:
-    def st_direction = ''
-    if (forwardStranded && !unStranded){
-        st_direction = "--fr"
-    } else if (reverseStranded && !unStranded){
-        st_direction = "--rf"
-    }
-    name = bam.toString() - ~/(_R1)?(_trimmed)?(\.sorted\.bam)?(\.fq)?(\.fastq)?(\.gz)?$/
-
     """
-    stringtie $bam \\
-        $st_direction \\
-        -o ${name}_transcripts.gtf \\
-        -v \\
-        -G $gtf \\
-        -A ${name}.gene_abund.txt \\
-        -C ${name}.cov_refs.gtf
-    stringtie ${name}_transcripts.gtf --merge -G $gtf -o ${name}_merged_transcripts.gtf
+    cat $stie $spades $ucsc > full.gtf
+    gffread -M --cluster-only -T  -F --keep-genes --keep-exon-attrs full.gtf > clustered.gtf
+    unify.py --gtf clustered.gtf > novel.gtf
+    grep "^#" novel.gtf > complete.gtf
+    cat $tx novel.gtf >> complete.gtf
+    bedtools sort -header -i complete.gtf > complete_sorted.gtf
     """
-}
+ }
 
-}
 
 /*
  * STEP N - QC

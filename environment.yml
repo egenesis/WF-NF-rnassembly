@@ -8,6 +8,8 @@ channels:
 dependencies:
   ## conda-forge packages
   - conda-forge::r-data.table=1.12.2
+  - conda-forge::pandas=0.25.2
+  - conda-forge::progressbar2=3.47.0
   - conda-forge::r-gplots=3.0.1.1
   - conda-forge::r-markdown=0.9
   - matplotlib=3.0.3        # Current 3.1.0 build incompatible with multiqc=1.7
