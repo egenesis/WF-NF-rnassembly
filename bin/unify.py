@@ -85,8 +85,8 @@ def solve_structure(fs, chr, start, end, strand, rloc):
                         gtf_transcript_key='transcript_id', gtf_gene_key='locus')
     txs = dict()
     possible_genes = Counter()
-    ensembl_id = None
-    gene_name = None
+    ensembl_id = "RLOC_%s" % rloc
+    gene_name = "RLOC_%s" % rloc
     in_ensembl = False
     cleaned = list()
     total = 0
@@ -131,21 +131,16 @@ def solve_structure(fs, chr, start, end, strand, rloc):
         cleaned = clean_tx(ctx, cleaned)
         logger.debug("## how many in cleaned %s out of %s" % (len(cleaned), total))
 
-    if gene_name:
-        gene.attributes['gene_name'] =  gene_name
-    if ensembl_id:
-        gene.attributes['gene_id'] = ensembl_id
+    gene.attributes['gene_name'] =  gene_name
+    gene.attributes['gene_id'] = ensembl_id
     print(gene)
     for tx in cleaned:           
         if tx["id"] in stats:
             stats[tx["id"]]['added'] = 1
-            if gene_name:
-                stats[tx["id"]]['gene_name'] = gene_name
+            stats[tx["id"]]['gene_name'] = gene_name
         for e in db.children(tx["id"], order_by="start"):
-            if gene_name:
-                e.attributes['gene_name'] = gene_name
-            if ensembl_id:
-                e.attributes['gene_id'] = ensembl_id
+            e.attributes['gene_name'] = gene_name
+            e.attributes['gene_id'] = ensembl_id
             e.attributes['gene_biotype'] = "predicted"
             e.attributes['locus'] = "RLOC_%s" % rloc
             print(e)
