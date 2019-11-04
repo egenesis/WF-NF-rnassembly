@@ -299,7 +299,7 @@ process merge {
  */
 if (!params.skipSpades){
     process spades {
-        label 'mid_memory'
+        label 'high_memory'
         publishDir "${params.outdir}", mode: 'copy'
 
         input:
@@ -356,6 +356,7 @@ process blastnt_known {
  * STEP N - Blastp-known
  */
 process blastnt_parse {
+    label 'mid_memory'
     publishDir "${params.outdir}/blastn_known", mode: 'copy'
     
     input:
@@ -376,6 +377,7 @@ process blastnt_parse {
  * STEP N - TransDecoder.longORF
  */
 process transdec_longorf {
+    label 'low_memory'
     publishDir "${params.outdir}/transdecoder", mode: 'copy'
 
     input:
@@ -435,6 +437,7 @@ process blastp {
 * STEP N -  transdecode Predict
 */
 process transdec_predict {
+    label 'low_memory'
     publishDir "${params.outdir}/transdecoder", mode: 'copy'
 
     input:
@@ -485,7 +488,7 @@ process pasa {
  */
 process annotation {
     publishDir "${params.outdir}/PASA", mode: 'copy'
-    label 'mid_memory'
+    label 'low_memory'
 
     input:
     file(bed) from transdecoder_bed
@@ -699,6 +702,7 @@ if(!params.skipAlignment){
  * STEP N - Unify
  */
  process unify {
+    label 'low_memory'
     publishDir "${params.outdir}/unify", mode: 'copy'
 
     input:
