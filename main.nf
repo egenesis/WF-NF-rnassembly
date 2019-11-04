@@ -34,7 +34,8 @@ def helpMessage() {
       --hisat2_index                Path to HiSAT2 index
       --fasta                       Path to genome fasta file
       --gtf                         Path to GTF file
-      --ucsc_gtf                        GTF files from UCSC alignment (custom made)
+      --tx                          Transcriptome FASTA file
+      --ucsc_gtf                    GTF files from UCSC alignment (custom made)
       --proteins                    ftp://ftp.uniprot.org/pub/databases/uniprot/current_release/knowledgebase/complete/uniprot_sprot.fasta.gz
       --saveReference               Save the generated reference files to the results directory
       --skipAlignment               Skip alignment altogether
@@ -222,7 +223,7 @@ if (!params.skipTrimming){
     * STEP N - Atropos
     */
     process trimming {
-        label 'trimming'
+        label 'low_memory'
         
 
         input: 
